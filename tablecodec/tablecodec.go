@@ -73,17 +73,18 @@ func EncodeRowKeyWithHandle(tableID int64, handle int64) kv.Key {
 // DecodeRecordKey decodes the key and gets the tableID, handle.
 func DecodeRecordKey(key kv.Key) (tableID int64, handle int64, err error) {
 	/* Your code here */
-	if len(key) != RecordRowKeyLen || !hasTablePrefix(key) || !hasRecordPrefixSep(key[prefixLen-recordPrefixSepLength:]) {
+	// modified according to the test in proj3
+	// there is a case where RecordKey < prefixLen+ idLen
+	if len(key) < prefixLen || !hasTablePrefix(key) || !hasRecordPrefixSep(key[prefixLen-recordPrefixSepLength:]){
 		return 0, 0, errInvalidRecordKey.GenWithStack("invalid record key - %q", key)
 	}
 	tableIDBytes := key[tablePrefixLength:tablePrefixLength+idLen]
 	uTableID := binary.BigEndian.Uint64(tableIDBytes)
 	tableID = codec.DecodeCmpUintToInt(uTableID)
-
+	
 	handleBytes := key[prefixLen:]
 	uHandle := binary.BigEndian.Uint64(handleBytes)
 	handle = codec.DecodeCmpUintToInt(uHandle)
-
 	return tableID, handle, nil
 }
 

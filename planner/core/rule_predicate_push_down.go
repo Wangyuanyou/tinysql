@@ -356,7 +356,46 @@ func (la *LogicalAggregation) PredicatePushDown(predicates []expression.Expressi
 	// TODO: Here you need to push the predicates across the aggregation.
 	//       A simple example is that `select * from (select count(*) from t group by b) tmp_t where b > 1` is the same with
 	//       `select * from (select count(*) from t where b > 1 group by b) tmp_t.
-	return predicates, la
+
+	canBePushed := make([]expression.Expression, 0, len(predicates))
+	canNotBePushed := make([]expression.Expression, 0, len(predicates))
+
+	aggExpresses := make([]expression.Expression, len(la.AggFuncs))
+	for _, fun := range la.AggFuncs {
+		aggExpresses =  append(aggExpresses, fun.Args[0])
+	}
+
+	groupbySchema :=  expression.NewSchema(la.groupByCols...)
+
+	for _, pred := range predicates {
+		switch pred.(type) {
+		case *expression.Constant:
+			// Have a looked at source code in TiDB
+			// Constant express should be retained and pushed down at the same time
+			// Consider SQL list "select sum(b) from t group by a having 1=0". "1=0" is a constant predicate which should be
+			// Without pushing down, we will get a wrong query result that contains one column with value 0 rather than an empty query result.
+			canBePushed = append(canBePushed, pred)
+			canNotBePushed = append(canNotBePushed, pred)
+		case *expression.ScalarFunction:
+			colsInCurPred:= expression.ExtractColumns(pred)
+			allInGroupbySchema := true
+			for _, col := range colsInCurPred{
+				if !groupbySchema.Contains(col) {
+					allInGroupbySchema = false
+					break;
+				}
+			}
+			if allInGroupbySchema { // can be pushed down 
+				canBePushed = append(canBePushed, pred)
+			} else { // cannot be pushed down 
+				canNotBePushed = append(canNotBePushed, pred)
+			}
+		default: // cannot be pushed down 
+			canNotBePushed = append(canNotBePushed, pred)
+		}
+	}
+	la.baseLogicalPlan.PredicatePushDown(canBePushed)
+	return canNotBePushed, la
 }
 
 // PredicatePushDown implements LogicalPlan PredicatePushDown interface.

@@ -495,7 +495,78 @@ func NewRulePushSelDownAggregation() Transformation {
 // or just keep the selection unchanged.
 func (r *PushSelDownAggregation) OnTransform(old *memo.ExprIter) (newExprs []*memo.GroupExpr, eraseOld bool, eraseAll bool, err error) {
 	// TODO: implement the algo according to the header comment.
-	return []*memo.GroupExpr{old.GetExpr()}, false, false, nil
+
+	// Extracted the logicplan nodes: sel + agg
+	oldSelLP := old.GetExpr().ExprNode.(*plannercore.LogicalSelection)
+	oldAggLP := old.Children[0].GetExpr().ExprNode.(*plannercore.LogicalAggregation)
+
+	// Groupdyschema will be used to figure out if a sel express can be pushed down
+	// A sel express can be pushed down only if all sel'columns are in groupbyschema
+	groupbySchema := expression.NewSchema(oldAggLP.GetGroupByCols()...)
+
+	canBePushed := make([]expression.Expression, 0, len(oldSelLP.Conditions))
+	canNotBePushed := make([]expression.Expression, 0, len(oldSelLP.Conditions))
+
+	for _, cond := range oldSelLP.Conditions {
+		switch cond.(type) {
+		case *expression.Constant:
+			canBePushed = append(canBePushed, cond)
+			canNotBePushed = append(canNotBePushed, cond)
+		case *expression.ScalarFunction:
+			colsInCond:= expression.ExtractColumns(cond)
+			allInGroupbySchema := true
+			for _, col := range colsInCond{
+				if !groupbySchema.Contains(col) {
+					allInGroupbySchema = false
+					break;
+				}
+			}
+			if allInGroupbySchema { // can be pushed down 
+				canBePushed = append(canBePushed, cond)
+			} else { // cannot be pushed down 
+				canNotBePushed = append(canNotBePushed, cond)
+			}
+		default:
+			canNotBePushed = append(canNotBePushed, cond)
+		}
+	}
+
+	if len(canBePushed) == 0 {
+		// If there is no canBePushed, there will be no new groupExpr
+		return nil, false, false, nil
+	}
+
+	/*  
+	    If there are some canBePushed
+		Build a new sel group express, which ExprNode is a sel logicplan containing all canBePushed
+		Put this new sel group between old agg and old agg'child
+	   (Need build a group for it, since the type of groupExpr's child is a group)
+	*/
+	oldAggChildGroup := old.Children[0].GetExpr().Children[0]
+	newSelDownLogicPlan := plannercore.LogicalSelection{Conditions: canBePushed}.Init(oldSelLP.SCtx())
+	newSelDownGroupExpr := memo.NewGroupExpr(newSelDownLogicPlan)
+	newSelDownGroupExpr.SetChildren(oldAggChildGroup)
+	newSelDownGroup := memo.NewGroupWithSchema(newSelDownGroupExpr, oldAggChildGroup.Prop.Schema)
+	aggGroupExpr := memo.NewGroupExpr(oldAggLP)
+	aggGroupExpr.SetChildren(newSelDownGroup)
+	
+	if len(canNotBePushed) == 0 {
+		return []*memo.GroupExpr{aggGroupExpr}, true, false, nil
+	}
+	
+
+	/*  
+	    If there are some cannotBePushed
+		Build a new sel group express, which ExprNode is a sel logicplan containing all cannotBePushed
+		Put this new sel group  on top of  old agg
+	*/
+	aggSchema := old.Children[0].Prop.Schema
+	aggGroup := memo.NewGroupWithSchema(aggGroupExpr, aggSchema)
+	newSelTopLP := plannercore.LogicalSelection{Conditions: canNotBePushed}.Init(oldSelLP.SCtx())
+	newSelTopGroupExpr := memo.NewGroupExpr(newSelTopLP)
+	newSelTopGroupExpr.SetChildren(aggGroup)
+	return []*memo.GroupExpr{newSelTopGroupExpr}, true, false, nil
+
 }
 
 // TransformLimitToTopN transforms Limit+Sort to TopN.
@@ -798,5 +869,35 @@ func (r *MergeAggregationProjection) Match(old *memo.ExprIter) bool {
 // It will transform `Aggregation->Projection->X` to `Aggregation->X`.
 func (r *MergeAggregationProjection) OnTransform(old *memo.ExprIter) (newExprs []*memo.GroupExpr, eraseOld bool, eraseAll bool, err error) {
 	// TODO: implement the body according to the header comment.
-	return []*memo.GroupExpr{old.GetExpr()}, false, false, nil
+
+	oldAggLP := old.GetExpr().ExprNode.(*plannercore.LogicalAggregation)
+	oldProjLP := old.Children[0].GetExpr().ExprNode.(*plannercore.LogicalProjection)
+	oldProjSchema := old.Children[0].GetExpr().Schema()
+
+	// use proj express and schema to substitute all column or express in groupby express
+	newGroupByItems := make([]expression.Expression, len(oldAggLP.GroupByItems))
+	for i, item := range oldAggLP.GroupByItems {
+		newGroupByItems[i] = expression.ColumnSubstitute(item, oldProjSchema, oldProjLP.Exprs)
+	}
+
+	// use proj express and schema to substitute all column or express in func express(func'args)
+	newAggFuncs := make([]*aggregation.AggFuncDesc, len(oldAggLP.AggFuncs))
+	for i, oldAggFunc := range oldAggLP.AggFuncs {
+		newAggFuncs[i] = oldAggFunc.Clone()
+		newArgs := make([]expression.Expression, len(oldAggFunc.Args))
+		for j, oldArg := range oldAggFunc.Args {
+			newArgs[j] = expression.ColumnSubstitute(oldArg, oldProjSchema, oldProjLP.Exprs)
+		}
+		newAggFuncs[i].Args = newArgs
+	}
+
+	newAggLP := plannercore.LogicalAggregation{
+		GroupByItems: newGroupByItems,
+		AggFuncs:     newAggFuncs,
+	}.Init(oldAggLP.SCtx())
+
+	newAggExpr := memo.NewGroupExpr(newAggLP)
+	newAggExpr.SetChildren(old.Children[0].GetExpr().Children...)
+
+	return []*memo.GroupExpr{newAggExpr}, true, false, nil
 }

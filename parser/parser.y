@@ -3809,12 +3809,21 @@ JoinTable:
 	{
 		$$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $3.(ast.ResultSetNode), Tp: ast.CrossJoin}
 	}
+
 	/* Your code here. */
-	/* build a JoinTable item  accoring to outer join grammar (left, right, full)*/
+	/*Inner Join and on condition Grammer*/
+|	TableRef CrossOpt TableRef "ON" Expression
+	{
+    	joinCond := &ast.OnCondition{Expr: $5}
+    	$$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $3.(ast.ResultSetNode), Tp: ast.CrossJoin, On: joinCond}
+  	}
+
+
+	/*Outer Join and on condition Grammer*/
 |	TableRef JoinType OuterOpt "JOIN" TableRef "ON" Expression
     {
-		joinCondPtr := &ast.OnCondition{Expr: $7}
-		$$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $5.(ast.ResultSetNode), Tp: $2.(ast.JoinType), On: joinCondPtr}
+		joinCond := &ast.OnCondition{Expr: $7}
+		$$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $5.(ast.ResultSetNode), Tp: $2.(ast.JoinType), On: joinCond}
 	}
 
 JoinType:

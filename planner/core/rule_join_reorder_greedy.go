@@ -40,6 +40,8 @@ type joinReorderGreedySolver struct {
 //
 // For the nodes and join trees which don't have a join equal condition to
 // connect them, we make a bushy join tree to do the cartesian joins finally.
+// here is a brief introduction of gready reorder approach: https://docs.pingcap.com/tidb/stable/join-reorder
+
 func (s *joinReorderGreedySolver) solve(joinNodePlans []LogicalPlan) (LogicalPlan, error) {
 	for _, node := range joinNodePlans {
 		_, err := node.recursiveDeriveStats()

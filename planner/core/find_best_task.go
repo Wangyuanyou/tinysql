@@ -210,8 +210,90 @@ type candidatePath struct {
 // (3): does it require a double scan.
 // If `x` is not worse than `y` at all factors,
 // and there exists one factor that `x` is better than `y`, then `x` is better than `y`.
+
+// return 1 if lhs not worse than rhs at all factors and there exists one factor that lhs is better than rhs
+// return -1 if rhs not worse than lhs at all factors and there exists one factor that rhs is better than lhs
+// otherwise return 0
 func compareCandidates(lhs, rhs *candidatePath) int {
 	// TODO: implement the content according to the header comment.
+	lAllNotWorseR :=true
+	rAllNotWorseL :=true
+
+	lExistsBetterR := false
+	rExistsBetterL := false
+
+	// 1. compare the set of columns
+	lCols := lhs.columnSet
+	rCols := rhs.columnSet
+
+	if (lCols.Len() == rCols.Len()){
+		if (!lCols.Equals(rCols)) {
+			lAllNotWorseR =false
+			rAllNotWorseL = false
+		}
+	}
+
+	if (lCols.Len() > rCols.Len()){
+		if (rCols.SubsetOf(lCols)){
+			lExistsBetterR = true
+			rAllNotWorseL = false
+		}else{
+			lAllNotWorseR =false
+			rAllNotWorseL = false
+		}
+	}
+
+	if (lCols.Len() < rCols.Len()){
+		if (lCols.SubsetOf(rCols)){
+			rExistsBetterL = true
+			lAllNotWorseR =false
+		}else{
+			lAllNotWorseR =false
+			rAllNotWorseL = false
+		}
+	}
+
+	if (!lAllNotWorseR && !rAllNotWorseL){
+		return 0
+	}
+
+	// 2. check if matches the physical property
+	if (lhs.isMatchProp != rhs.isMatchProp){
+		if lhs.isMatchProp {
+			rAllNotWorseL = false
+			lExistsBetterR = true
+		}else{
+			lAllNotWorseR =false
+			rExistsBetterL = true
+		}
+	}
+	if (!lAllNotWorseR && !rAllNotWorseL){
+		return 0
+	}
+
+	// 3. if it require a double scan
+	if (lhs.isSingleScan != rhs.isSingleScan){
+		if lhs.isSingleScan {
+			rAllNotWorseL = false
+			lExistsBetterR = true
+		}else{
+			lAllNotWorseR =false
+			rExistsBetterL = true
+		}
+	}
+
+	if (!lAllNotWorseR && !rAllNotWorseL){
+		return 0
+	}
+
+	if lAllNotWorseR && lExistsBetterR {
+		return 1
+	}
+
+	if rAllNotWorseL && rExistsBetterL {
+		return -1
+	}
+
 	return 0
 }
 
@@ -274,7 +356,28 @@ func (ds *DataSource) skylinePruning(prop *property.PhysicalProperty) []*candida
 		// TODO: Here is the pruning phase. Will prune the access path which is must worse than others.
 		//       You'll need to implement the content in function `compareCandidates`.
 		//       And use it to prune unnecessary paths.
-		candidates = append(candidates, currentCandidate)
+		notWorseThanAll := true
+		woreseThanCurs := make([]int, 0)
+		for i, candidate := range candidates {
+			worseThanCand :=  compareCandidates(candidate, currentCandidate)
+			if worseThanCand !=0 {
+				if worseThanCand == 1 {
+					notWorseThanAll = false
+				}else{
+					woreseThanCurs = append(woreseThanCurs, i)
+				}
+			}
+		}
+
+		if notWorseThanAll {
+			candidates = append(candidates, currentCandidate)
+
+			if len(woreseThanCurs) > 0 {
+				for _, inx := range woreseThanCurs{
+					candidates = append(candidates[:inx], candidates[inx+1:]...)
+				}
+			}
+		}
 	}
 	return candidates
 }

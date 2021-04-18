@@ -154,6 +154,57 @@ func (e *HashJoinExec) fetchAndBuildHashTable(ctx context.Context) error {
 	// You'll need to store the hash table in `e.rowContainer`
 	// and you can call `newHashRowContainer` in `executor/hash_table.go` to build it.
 	// In this stage you can only assign value for `e.rowContainer` without changing any value of the `HashJoinExec`.
+
+    /****************************************** init hash context (inner side)***************************************************/
+	// hashTableKeyColIdx is a list of col index (the kth col in a row )
+	// and the value in the cols will be used to generate key of our hash table 
+	hashKeyColIdx := make([]int, 0) // buildKeyColIdx is a 
+	for _, keyCol := range e.innerKeys {
+		hashKeyColIdx = append(hashKeyColIdx, keyCol.Index)
+	}
+	hashKeyColTypes := e.innerSideExec.base().retFieldTypes
+
+	// init hash context acccording to he inner side excutor 
+	// a list of key col data type + a list of key col index
+	hCtx := &hashContext{
+		allTypes:  hashKeyColTypes,
+		keyColIdx: hashKeyColIdx,
+	}
+
+
+	/****************************************** init HashRowContainer***************************************************/
+	// RowContainer is a abstraction of row container, which is container for all rows (in disck or in memory)
+	// HashRowContainer = RowContainer + hash table 
+	initList := chunk.NewList(hashKeyColTypes, e.initCap, e.maxChunkSize)
+	e.rowContainer = newHashRowContainer(e.ctx, int(e.innerSideEstCount), hCtx, initList)
+	
+
+
+	/************************* Traveser all row from InnerSideExec and Build hash table***********************************/
+	// a loop to read a chunk from innerSideExec 
+	// and then push it into newHashRowContainer
+	// finally we will get a hash map and a row container (containing all rows from InnerSideExec)
+	for {
+
+		// 1. init a chunk and fetch a chunk of data from innerSideExec
+		chk := chunk.NewChunkWithCapacity(hashKeyColTypes, e.ctx.GetSessionVars().MaxChunkSize)
+		err := Next(ctx, e.innerSideExec, chk) 
+		if err != nil {
+			return err
+		}
+	
+		if chk.NumRows() > 0 {
+			// 2. add the chunk into HashRowContainer
+			// HashRowcontainer will build hash table according to every row and put row into Rowcontainer 
+			err = e.rowContainer.PutChunk(chk)
+			if err != nil {
+				return err
+			}
+		}else{
+			break // loop exit condition: there is not data from innerSideExec
+		}
+	}
+
 	return nil
 }
 
@@ -250,6 +301,79 @@ func (e *HashJoinExec) runJoinWorker(workerID uint, outerKeyColIdx []int) {
 	// You may pay attention to:
 	// 
 	// - e.closeCh, this is a channel tells that the join can be terminated as soon as possible.
+	
+	// main workflow in this function is below:
+	// 1. get a chunk from e.outerResultChs(this chunk is fetched by outerSideExec)
+	// 2. do join, compare this chunk with the hash table(was built according to the chunk from innerSideExec)
+	// 3. send a empty chunk(outerChkResource) to e.outerChkResourceCh, which will notify outer fetcher that this worker has finsihed a chunk
+	// 4. if not e.closeCh -> go back to 1 
+
+
+	/****************************************** prepare steps ***************************************************/
+	// 1. request a container(reusable) to store join final result
+	// getNewJoinResult will return <hashjoinWorkerResult>
+	// which is reusable container of final join result 
+	// <hashjoinWorkerResult> = chunk + channel(will be used to notify upstream that this container can be reused)
+	ok, oneJoinResult := e.getNewJoinResult(workerID)
+	if !ok {
+		return
+	}
+
+	// 2. a hash context for outer rows 
+	// Below is who wew  a hash context for outer rows 
+	// when do join, we will first caculate the hash value of outer rows in the same column
+	// then compare the inner hash table, if matched one innner hash key
+	// then check the key columns in detail and calculate the join result according to if matched and join type
+	outerHashContext := &hashContext{
+		allTypes: e.outerSideExec.base().retFieldTypes,
+		keyColIdx: outerKeyColIdx,
+	}
+
+	//3. selected : a list of bool 
+	// it will passed into join function and finaly figure out if a row is selected based on  outer filter
+	selected := make([]bool, 0, chunk.InitialCapacity)
+
+	/**************************************** Join Proccess Loop  *****************************************/
+	for ok := true; ok; {
+		// 1. waiting one outer executor result from channel 
+		var oneOuterResult *chunk.Chunk
+		select {
+			case <-e.closeCh: // entire join has been terminated
+				break
+			case oneOuterResult, ok = <-e.outerResultChs[workerID]:
+		}
+		if !ok {
+			break // loop exit condition:  outerResultChs has been closed
+		}
+		
+
+		// 2. compare currrent oneOuterResult with inner hashtable and get the join result
+		// inside join2Chunk, if there one join result chunk is full, 
+		// it will help you send this result into e.joinResultCh
+		// and help you request a new result container via e.getNewJoinResult(workerID)
+		ok, oneJoinResult = e.join2Chunk(workerID, oneOuterResult, outerHashContext, oneJoinResult, selected) 
+		if !ok {
+			break
+		}
+
+		// 3. reset oneOuterResult and send it into e.outerChkResourceCh to be resued later
+		oneOuterResult.Reset()
+		outerIdleResource := &outerChkResource{
+			dest: e.outerResultChs[workerID],
+		}
+		outerIdleResource.chk = oneOuterResult
+		e.outerChkResourceCh <- outerIdleResource 
+	}
+
+	// when exit above loop, we will have finished all join tasks
+	// only one thing is remained. If there are some rows in oneJoinResult, send it into e.joinResultCh
+	if oneJoinResult == nil {
+		return
+	}
+	if oneJoinResult.err != nil || (oneJoinResult.chk != nil && oneJoinResult.chk.NumRows() > 0) {
+		e.joinResultCh <- oneJoinResult
+	}
+
 }
 
 func (e *HashJoinExec) getNewJoinResult(workerID uint) (bool, *hashjoinWorkerResult) {

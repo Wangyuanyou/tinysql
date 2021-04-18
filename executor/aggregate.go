@@ -16,6 +16,7 @@ package executor
 import (
 	"context"
 	"sync"
+	"github.com/spaolacci/murmur3"
 
 	"github.com/cznic/mathutil"
 	"github.com/pingcap/errors"
@@ -353,6 +354,38 @@ func (w *HashAggPartialWorker) updatePartialResult(ctx sessionctx.Context, sc *s
 // We only support parallel execution for single-machine, so process of encode and decode can be skipped.
 func (w *HashAggPartialWorker) shuffleIntermData(sc *stmtctx.StatementContext, finalConcurrency int) {
 	// TODO: implement the method body. Shuffle the data to final workers.
+	// this shuffle process is almost the same with the shuffle process in mapreduce
+	// finalConcurrency can be considered the amount of reducer workers
+	// HashAggPartialWorker can be considered as mapper worker
+	// mapper workers' result is saved in its own partialResultsMap
+
+	// init a map: finalWorkID2groupKeyVals
+	//all groupKey val (str) in finalWorkID2groupKeys[k] will sent to and processed by kth final worker
+	fWorkIdx2GroupKeys:= make([][]string, finalConcurrency)
+	for i, _ := range fWorkIdx2GroupKeys{
+		fWorkIdx2GroupKeys[i] = make([]string, 0) 
+	}
+
+	// build this map: finalWorkID2groupKeyVals
+	// traverse all key(groupkey) values in this HashAggPartialWorker
+	// hash(key values) mode finalConcurrency -> finalworkerID
+	for groupKey, _ := range w.partialResultsMap{
+		fWorkIdx := int(murmur3.Sum32([]byte(groupKey))) % finalConcurrency
+		fWorkIdx2GroupKeys[fWorkIdx] = append(fWorkIdx2GroupKeys[fWorkIdx], groupKey)
+	}
+
+	// send the different list of groupkeys to related final workers
+	for fWorkIdx, groupKeys := range fWorkIdx2GroupKeys{
+		if len(groupKeys) > 0 {
+			w.outputChs[fWorkIdx] <- &HashAggIntermData{
+				groupKeys:        groupKeys,
+				// in tidb design, it send entire result into the final worker
+				// and final worker will extract its data according to groupKeys
+				partialResultMap: w.partialResultsMap, 
+			}
+		}
+	}
+
 }
 
 // getGroupKey evaluates the group items and args of aggregate functions.
@@ -423,6 +456,70 @@ func (w *HashAggFinalWorker) getPartialInput() (input *HashAggIntermData, ok boo
 
 func (w *HashAggFinalWorker) consumeIntermData(sctx sessionctx.Context) (err error) {
 	// TODO: implement the method body. This method consumes the data given by the partial workers.
+
+	// StmtCtx holds variables for current executing statement.
+	stmtCtx := sctx.GetSessionVars().StmtCtx
+	
+	// Shortly, in this there will be a loop to receive IntermData from partial worker and process it
+	for {
+		// getPartialInput will wait data from w.inputCh and return it if it receive one
+		// the struct of intermData is the almost the same with the data sent out by shuffleIntermData
+		intermData, ok := w.getPartialInput() 
+		if !ok {
+			break // !ok means w.inputCh has been close -> all inputs have been processed
+		} 
+
+		for {
+			// this loop extract data(groupkeys + groupkeys' partial result) from current intermData
+			// But we process this data in batch
+			// we just process w.maxChunkSize size(row) data every time
+			// break this loop util all data in this intermData has been processed 
+
+			// extract a batch of data from entire intermData
+			// batchPartialResults and batchGroupKeys is the data we need to process in this batch 
+			batchPartialResults := make([][]aggfuncs.PartialResult, 0, w.maxChunkSize)
+			batchGroupKeys := make([]string, 0)
+			var reachedEnd bool
+			batchPartialResults, batchGroupKeys, reachedEnd = intermData.getPartialResultBatch(stmtCtx, batchPartialResults, w.aggFuncs, w.maxChunkSize)
+
+			// start processing current batch data
+			// 1. update this final worker's groupkeys (I guess it rocords the gourpkeys which this worker is processing currently)
+			// just notice that the type of w.groupKeys is [][]byte, but  the type of batchGroupKeys is []string
+			w.groupKeys = w.groupKeys[:0]
+			for _, groupKey:= range  batchGroupKeys{
+				w.groupKeys = append(w.groupKeys, []byte(groupKey))
+			}
+
+			//2. extract every groupkey's current final result from w.partialResultMap
+			// finalPartialResults is [][]aggfuncs.PartialResult
+			// w.groupKeys[i]'s current final result is saved in finalPartialResults[i]
+			// when w.inputCh is closed, current final result will be final result
+			// if groupKeys[i] is not in w.partialResultMap, getPartialResult will help us init a (zero)finalresult 
+			batchfinalResults := w.getPartialResult(stmtCtx, w.groupKeys, w.partialResultMap)
+
+
+			//3 finally, a loop to traverse groupkey in batchGroupKeys
+			// update current finaly result 
+			// finalPartialResults[i] = finalPartialResults[i] + batchPartialResults[i] (via af.MergePartialResult)
+			for i, groupKey := range batchGroupKeys {
+
+				// update w.groupSet if there is a need
+				if !w.groupSet.Exist(groupKey) {
+					w.groupSet.Insert(groupKey)
+				}
+
+				// do finalPartialResults[i] = finalPartialResults[i] + batchPartialResults[i] on all aggFuncs
+				for j, affFunc := range w.aggFuncs {
+					if err = affFunc.MergePartialResult(sctx, batchPartialResults[i][j], batchfinalResults[i][j]); err != nil {
+						return err
+					}
+				}
+			}
+			if reachedEnd {
+				break
+			}
+		}
+	}
 	return nil
 }
 
